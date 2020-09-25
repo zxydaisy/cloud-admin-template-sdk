@@ -4,8 +4,11 @@ import { AtomTemplate, resolverAst } from "./parseArrowFun";
 import { ResolverType } from "../dsl-to-gql/interfaceStructure";
 import { getSuccessResponse } from "../dsl-to-gql/config";
 import _get = require("lodash.get");
+import visit from "../define/visit";
+import generator from "@babel/generator";
 
-type ExpressionAST = {
+// 参数里面指向的属性节点
+type ProperNodeAST = {
   name: string;
   resolverName: string;
   type: string;
@@ -29,6 +32,33 @@ function findResolver(object: any) {
       return o.name === object.resolverName;
     }) || {};
   return resolver;
+}
+
+function getRealCode(keyUUID: string, ast: any) {
+  // MemberExpression
+  visit(
+    ast,
+    {
+      MemberExpression: (node: any) => {
+        if (node.object.resolvers) {
+          // 找到完全匹配的 resolver 和标记的 uuid
+          const resolver = findResolver(node.object);
+          const uuid = resolver.uuid;
+          if (uuid === keyUUID) {
+            // 如果和当前的 uuid 完全匹配的话，名字更新为 o
+            node.object.name = "o";
+          } else {
+            // 不匹配的更新为当前的标记数据，但是只更新有引用源的数据
+            node.object.name = `args.${uuid}_Data`;
+          }
+        }
+        console.info("after change ", node);
+      },
+    },
+    {}
+  );
+
+  return generator(ast).code;
 }
 
 const assignTemplate = [
@@ -61,16 +91,18 @@ function ObjectAssign(uuidData: string, combineStr: string) {
 const callArrayTemplate = (
   leftUUID: string,
   params: any[],
-  rightUUID: string
+  rightUUID: string,
+  leftCode: string // 因为结构返回的是有结构的数据，但是实际使用的时候需要根据接口结构的 code 提取
 ) => {
   const result = `function arrayCall${leftUUID}() {
     const data = [];
-    Object.values(args.${rightUUID}_Data).forEach((o) => {
-      const tempData = resolvers.Query.${leftUUID}(null, ${
+    Object.values(args.${rightUUID}_Data).forEach(async (o) => {
+      const tempData = await resolvers.Query.${leftUUID}(null, ${
     params.length > 0 ? params.join(",") : "{}"
   });
+      const realCode = _get(tempData, "${leftCode}");
        // 多个参数的返回结果
-      data.push(tempData);
+      data.push(realCode);
     })
     return data;
   }
@@ -126,22 +158,38 @@ export function GenFullResolver(allEndpoints: any) {
         function anlysisProperties(expression: any, parentType: any) {
           // 进入第二层分析的时候
           const { ast, properties, items, type } = expression;
+          // 找到当前的数据源
+          const parentResolver = findResolver(ast);
 
           function anlysisPropertiesTo(
             properties: any = [],
-            parentType: string
+            parentType: string,
+            parentResolver: any
           ) {
             const tempCode = ["{"];
             Object.keys(properties || []).forEach((properKey) => {
               const proper = properties[properKey];
               // 如果是个复杂的 proper
               if (proper.properties) {
-                // 结构继续进入复杂 proper 的分析
+                /**
+                 * 结构继续进入复杂 proper 的分析
+                 *
+                 */
                 tempCode.push(
                   `${properKey}: ${anlysisProperties(proper, parentType)},`
                 );
               } else {
-                tempCode.push(`${properKey}: o.${proper.ast.property.name},`);
+                console.info("proper", proper);
+                // 如果式当前的，也就是 key 表示将的数据源结构
+                const keyUUID = parentResolver.uuid;
+                /**
+                 *  proper 可能只是简单的表达式比如 Room.addressId
+                 *  也可能式复杂的表达式，比如 'Employee.name + " " + Room.name'
+                 *
+                 *  因为如果是复杂的数据源，解析的时候需要根据请求源替换名字
+                 */
+                const code = getRealCode(keyUUID, proper.ast);
+                tempCode.push(`${properKey}: ${code},`);
               }
             });
             tempCode.push("}");
@@ -155,7 +203,7 @@ export function GenFullResolver(allEndpoints: any) {
             result.push(
               ObjectAssign(
                 `args.${getResovlerUUId(ast)}_Data[index]`,
-                anlysisPropertiesTo(properties, parentType)
+                anlysisPropertiesTo(properties, parentType, parentResolver)
               )
             );
           }
@@ -165,7 +213,7 @@ export function GenFullResolver(allEndpoints: any) {
             result.push(
               ObjectAssign(
                 `args.${getResovlerUUId(ast)}_Data`,
-                anlysisPropertiesTo(properties, parentType)
+                anlysisPropertiesTo(properties, parentType, parentResolver)
               )
             );
           }
@@ -175,7 +223,11 @@ export function GenFullResolver(allEndpoints: any) {
             result.push(
               ArrayAssign(
                 `args.${getResovlerUUId(ast)}_Data`,
-                anlysisPropertiesTo(items.properties, parentType)
+                anlysisPropertiesTo(
+                  items.properties,
+                  parentType,
+                  parentResolver
+                )
               )
             );
           }
@@ -205,14 +257,17 @@ export function GenFullResolver(allEndpoints: any) {
           let isVisitable = true;
           let arrayExpression = false;
           const uuid = getResovlerUUId(sourceItem);
-
-          // if (!allResolvers.uuid) {
-          //   如果指向的是结构，那么在入口进来的地方，这个结构也同样会被定义， 所以同样可以直接使用
-          // }
+          // 引用的请求源头解析出来 resolver 是包含 code 信息的
+          const resolver = findResolver(sourceItem);
+          /**
+           * eg: data.Data
+           *
+           * 因为返回结构其实是包含解析结构里面默认的 data, 所以在这里去掉
+           */
+          const leftCode = resolver.code.replace(/^data\./, "");
           /**
            * 无论当前 source 结构是已经被定义，访问还是正常执行，但是依赖的参数如果没有已经被访问
            * 那么需要进入访问队列
-           *
            */
           if (Object.values(assignments || []).length > 0) {
             params = [];
@@ -240,13 +295,35 @@ export function GenFullResolver(allEndpoints: any) {
                 map[leftKey] = true;
                 params.push(leftKey);
               } else {
-                // 标记某一个参数是数组类型的和左侧的赋值不一样，就需要遍历处理
-                // 在右边的参数，多个 resolver 里面找到当前要用的 resolver
+                /** 参数的 ast 结构，主要是为了解析出左侧的结构和右侧的结构
+                 *  因为是参数，那么一定是分做和有的赋值结构，这个 ast 是否可能是 BinaryExpression
+                 *  { type: 'AssignmentExpression',
+                      left:
+                      { type: 'MemberExpression',
+                        object:
+                          { type: 'Identifier',
+                            name: 'Address',
+                            resolverName: 'getAddress',
+                            properties: [Object],
+                            resolvers: [Array] },
+                        property: { type: 'Identifier', name: 'id' } },
+                      right:
+                      { type: 'MemberExpression',
+                        object:
+                          { type: 'Identifier',
+                            name: 'Room',
+                            resolverName: 'getRoom',
+                            properties: [Object],
+                            resolvers: [Array] },
+                        property: { type: 'Identifier', name: 'addressId' } },
+                      operator: '=' }
+                 */
                 const resolverUUID = getResovlerUUId(ast.right.object);
                 // 如果已经被求过值了，那么参数直接用，
                 if (map[`${resolverUUID}_Data`]) {
-                  // Notice 这里是针对对象的聚合方式，如果是数组的话，需要单独处理
-                  // 因为这里的 right name 在表达式里面使用，所以其实是用表达式的唯一标记方式
+                  /**
+                   * 目前右侧是单个源，并且是 MemberExpression，所以可以找到匹配的名字
+                   */
                   const rightName = ast.right.object.name;
                   // 检查这个右边的 resolver 的返回是否是数组
                   const rightResolverType = CheckResolverReturnType(
@@ -262,11 +339,12 @@ export function GenFullResolver(allEndpoints: any) {
                     // 因为参数如果是数组，要赋予值给左侧  string ，确实是需要循环处理的， 并且在循环处理的过程中还会用到这个结果数组
                     arrayExpression = true;
                     rightResolverUUID = resolverUUID;
+
                     paramName = right.replace(new RegExp(`^${rightName}`), `o`);
                   } else {
                     paramName = right.replace(
                       new RegExp(`^${rightName}`),
-                      `args.${resolverUUID}_Data`
+                      `(args.${resolverUUID}_Data || {})`
                     );
                   }
                   /**
@@ -288,13 +366,18 @@ export function GenFullResolver(allEndpoints: any) {
             if (arrayExpression) {
               // 如果是走数组表达式， 当前的标记对象也会被转化数组类型的结果
               codeResult.push(
-                callArrayTemplate(uuid, params, rightResolverUUID)
+                callArrayTemplate(uuid, params, rightResolverUUID, leftCode)
               );
             } else {
+              /**
+               * 这里的被赋值的结构，也是需要请求源的结构解析出来
+               */
               codeResult.push(
-                `args.${uuid}_Data = resolvers.Query.${uuid}(null, ${
+                `args.${uuid}_Data = await resolvers.Query.${uuid}(null, ${
                   params.length > 0 ? params.join(",") : "{}"
-                }) || {};`
+                }) || {};
+                 args.${uuid}_Data = _get(args.${uuid}_Data, "${leftCode}");
+                `
               );
             }
           } else {
@@ -355,8 +438,10 @@ function PathNodeUpdate(
   return properties;
 }
 
+// 输出为 js，所以还需要保留 js 的写法
 const RootTemplete = `
 import requester from './requester';
+import _get from "lodash.get";
 
 export const resolvers = {
   Query: {}
